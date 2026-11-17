@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 from typing import Any
 
 import psycopg
@@ -81,13 +82,17 @@ def index_is_valid_unique(conn: psycopg.Connection, index_name: str) -> bool:
 
 # ----------------------------- 后端进程 ---------------------------------
 
+# pg_stat_activity 中语句文本被权限遮蔽时显示的占位内容
+_MASKED_QUERY_MARK = "insufficient privilege"
+
+
 def get_backend_state(conn: psycopg.Connection, pid: int | None) -> dict[str, Any] | None:
     if not pid:
         return None
     row = conn.execute(
         """
         SELECT pid, state, wait_event_type, wait_event,
-               left(query, 200) AS query, query_start
+               left(query, 400) AS query, query_start, backend_start
         FROM pg_stat_activity
         WHERE pid = %s
         """,
@@ -96,16 +101,70 @@ def get_backend_state(conn: psycopg.Connection, pid: int | None) -> dict[str, An
     return dict(row) if row else None
 
 
-def backend_running_create_index(conn: psycopg.Connection, pid: int | None) -> bool:
-    """判断该后端是否仍在执行（或等待执行）CREATE INDEX。
+# 本轮构建语句的固定形态：CREATE UNIQUE INDEX CONCURRENTLY "<index_name>" ON ...
+_CREATE_UNIQUE_INDEX_RE = re.compile(
+    r"\bCREATE\b\s+\bUNIQUE\b\s+\bINDEX\b\s+\bCONCURRENTLY\b"
+)
 
-    要求 state='active'：语句结束后的 idle 后端即使保留相同 query 文本也不算在跑。
+
+def query_matches_create_index(query: str | None, index_name: str) -> bool | None:
+    """判断语句是否为本索引的 CREATE UNIQUE INDEX CONCURRENTLY。
+
+    返回 True（确认是）/ False（确认不是）/ None（语句被权限遮蔽，无法确认）。
+    补录 INSERT、其它索引的 DDL 等均确认不是，可用于取消信号的归属核对。
     """
-    st = get_backend_state(conn, pid)
-    if st is None or st.get("state") != "active":
+    if not query:
         return False
-    q = (st.get("query") or "").upper()
-    return "CREATE" in q and "INDEX" in q
+    if _MASKED_QUERY_MARK in query.lower():
+        return None
+    normalized = " ".join(query.upper().split())
+    if not _CREATE_UNIQUE_INDEX_RE.search(normalized):
+        return False
+    return index_name.upper() in normalized
+
+
+def create_index_backend_state(
+    conn: psycopg.Connection,
+    index_name: str,
+    pid: int | None = None,
+    backend_start: Any = None,
+) -> str:
+    """确认本索引的 CREATE 语句是否仍在执行："running" / "stopped" / "unknown"。
+
+    依据“语句身份 + 连接代际”判定，而非单纯进程号：
+    * 记录在案的 (pid, backend_start) 代际相符、活跃且正在执行本语句 -> running；
+    * 代际不符（PID 已被新连接复用）说明原构建后端已退出，该 PID 不算在跑；
+    * 再全库扫描是否有任何后端活跃执行本语句（覆盖 PID 未登记等时序）；
+    * 语句文本被权限遮蔽而无法判定时返回 unknown——不可据此裁决终局。
+    """
+    unknown = False
+    if pid:
+        st = get_backend_state(conn, pid)
+        if st is not None:
+            same_generation = backend_start is None or st["backend_start"] == backend_start
+            if same_generation and st.get("state") == "active":
+                match = query_matches_create_index(st.get("query"), index_name)
+                if match is True:
+                    return "running"
+                if match is None:
+                    unknown = True
+            # 同代但已空闲/在跑别的语句：本语句已结束；代际不符：原后端已退出。
+            # 两者都继续走全库扫描兜底。
+    rows = conn.execute(
+        """
+        SELECT pid, left(query, 400) AS query
+        FROM pg_stat_activity
+        WHERE state = 'active' AND pid <> pg_backend_pid()
+          AND datname = current_database()  -- 只认本库后端：他库同名索引构建不算
+        """
+    ).fetchall()
+    for row in rows:
+        match = query_matches_create_index(row["query"], index_name)
+        if match is True:
+            return "running"
+        if match is None:
+            unknown = True
+    return "unknown" if unknown else "stopped"
 
 
 # ----------------------------- 轮次表 -----------------------------------

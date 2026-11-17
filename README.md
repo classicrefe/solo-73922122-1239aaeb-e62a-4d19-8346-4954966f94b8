@@ -29,7 +29,8 @@ docker compose up --build
 目标唯一索引：`uq_reports_lab_no_report_no ON reports (lab_no, report_no)`，
 键为「实验室号 + 报告号」，即**实验室内报告号唯一**（不同实验室允许相同报告号）。
 
-另有轮次表 `index_build_rounds` 持久化每次构建的状态、后端 PID 与错误信息，用于重启接续。
+另有轮次表 `index_build_rounds` 持久化每次构建的状态、后端身份
+（`backend_pid` + 连接代际 `backend_start`）与错误信息，用于取消归属核对与重启接续。
 
 ## 3. API
 
@@ -40,14 +41,14 @@ docker compose up --build
 | GET | `/reports` | 分页查询报告 |
 | POST | `/index/build` | 发起/复用 `CREATE UNIQUE INDEX CONCURRENTLY`（202） |
 | GET | `/index/status` | 查询轮次状态 + `pg_index` 中索引的真实有效性 |
-| POST | `/index/cancel` | 受理取消（202 `cancel_requested`），SQL 确认停止后才 `cancelled` |
+| POST | `/index/cancel` | 受理取消（202 `cancel_requested`）；归属核对通过才发取消信号，原 SQL 确认停止且索引无效后才 `cancelled` |
 
 构建轮次状态机：
 
 ```
 running ──索引有效──▶ complete
 running ──重复键等失败──▶ failed（安全清理无效索引，reports 原数据不动，去重后可重试）
-running ──受理取消──▶ cancel_requested ──后端 SQL 确认停止──▶ cancelled
+running ──受理取消──▶ cancel_requested ──原 SQL 确认停止且索引无效──▶ cancelled
 索引已有效时再发起/取消：直接报 complete，绝不删除有效索引
 ```
 
@@ -59,11 +60,20 @@ running ──受理取消──▶ cancel_requested ──后端 SQL 确认停�
   应用层再次发起时返回同一轮（`reused=true`），不新开。
 - **重复键失败保留原数据、去重后可重试**：失败只产生无效索引，`reports` 一行不动；
   系统安全清理无效索引后，用 `sql/03_dedupe.sql` 去重即可重新发起。
-- **取消两阶段、不误伤**：
+- **取消两阶段、归属核对、不误伤**：
   1. `POST /index/cancel` 先落 `cancel_requested` 并立即返回 202；
-  2. 仅对轮次记录在案的构建后端 PID 调用 `pg_cancel_backend`（不触碰补录连接）；
-  3. watcher 轮询 `pg_stat_activity`，**确认该后端的 CREATE INDEX 真正停止**后才报
-     `cancelled`；若取消未生效而索引已建成，则如实报 `complete` 并保留索引。
+  2. 仅当**确认**记录在案的连接仍在执行本轮 `CREATE UNIQUE INDEX CONCURRENTLY`
+     时才发 `pg_cancel_backend`。核对为三重身份：`backend_pid` 一致、连接代际
+     `backend_start` 一致（旧构建连接断开后 PID 可能被补录连接复用，仅凭 PID
+     会误停补录）、当前语句文本确为本索引的 `CREATE UNIQUE INDEX CONCURRENTLY`；
+  3. 无法确认时（后端未登记、已断开、PID 已换代、语句不符或视图权限受限），
+     只保持 `cancel_requested` 待核实（响应 `cancel_signal=pending_verification`），
+     不向任何连接发信号，也**不凭进程号消失/变化报取消**；
+  4. watcher 以“全库无任何后端在执行本索引的 CREATE 语句”为停止确认：
+     确认停止且索引无效 → `cancelled` 并安全清理；索引有效 → `complete` 并保留；
+     权限受限无法确认时一直待核实，绝不猜测裁决；
+  5. `cancel_requested` 期间重复发起 `/index/build` 仍复用同一轮，
+     状态查询与补录不受影响。
 - **API 重启接续，不重跑、不虚报**：启动时以系统目录为准对账——
   构建仍在跑则只挂 watcher 接续跟踪（`restarted=true`，同一 backend PID，不重发 DDL）；
   后端已停且索引无效则裁决 `failed/cancelled` 并清理；索引有效则报 `complete`。
@@ -83,7 +93,7 @@ running ──受理取消──▶ cancel_requested ──后端 SQL 确认停�
 bash demo/01_long_transaction.sh   # 长事务拖慢构建 + 构建期补录照常提交
 bash demo/02_duplicate_key.sh      # 重复键失败->原数据保留->去重重试成功->409
 bash demo/03_restart_recovery.sh   # API 重启接续跟踪，不重跑、不虚报
-bash demo/04_cancel.sh             # 取消受理/确认、不误伤补录、有效索引不删除
+bash demo/04_cancel.sh             # 取消受理/确认、归属核对（PID 复用不误停补录）、有效索引不删除
 ```
 
 > 受限沙箱若禁止进程信号，`pg_cancel_backend` 无法中止后端；演示 4 会如实展示
@@ -104,6 +114,10 @@ pytest -q
 app/            FastAPI 应用（main 路由、service 构建编排、db 访问层、schemas）
 sql/            建表、补录示例、去重脚本
 demo/           四个端到端演示 + 长事务持有助手
-tests/          pytest 关键功能自测（9 个用例）
+tests/          pytest 关键功能自测（13 个用例，含连接换代交错的取消归属核对）
 Dockerfile, docker-compose.yml, requirements.txt
 ```
+
+环境变量：`DATABASE_URL`、`BUILD_LOCK_TIMEOUT_MS`（构建锁等待上限，0 不限）、
+`RECONCILE_INTERVAL_S`（对账轮询间隔）、`CANCEL_VERIFY_GRACE_S`（取消核实宽限：
+轮次从未登记过后端时，判定“SQL 已停止”前的等待窗口）、`UNIQUE_INDEX_NAME`。

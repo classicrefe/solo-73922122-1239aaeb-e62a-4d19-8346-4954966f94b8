@@ -3,8 +3,14 @@
 状态机（index_build_rounds.status）：
     running ──成功且索引有效──▶ complete
     running ──重复键等失败───▶ failed（先安全清理无效索引，原表数据不动）
-    running ──受理取消────────▶ cancel_requested ──后端确认停止──▶ cancelled
+    running ──受理取消────────▶ cancel_requested ──原 SQL 确认停止且索引无效──▶ cancelled
     complete 之后再取消/发起：直接报完成，不动索引。
+
+取消的后端归属核对（防 PID 复用误停补录）：
+    取消信号只发给“确认仍在执行本轮 CREATE UNIQUE INDEX CONCURRENTLY”的连接，
+    核对三重身份：backend_pid 一致、连接代际 backend_start 一致、当前语句文本
+    确为本索引的 CREATE 语句。无法确认时仅受理并保持 cancel_requested 待核实，
+    不向任何连接发信号，也不凭进程号消失/变化报取消。
 """
 from __future__ import annotations
 
@@ -45,9 +51,12 @@ class IndexBuildService:
     """进程内单例。线程模型：最多一个构建线程；重启后以 watcher 线程接续。"""
 
     def __init__(self) -> None:
-        self._lock = threading.RLock()          # 保护 _thread/_watching
+        self._lock = threading.RLock()          # 保护 _thread/_watching/_signalled
         self._thread: threading.Thread | None = None
         self._watching_round_id: str | None = None
+        # 已发取消信号的连接身份：round_id -> (pid, backend_start)，
+        # 防止 watcher 与请求线程对同一代后端重复发信号。
+        self._signalled: dict[str, tuple[int, str]] = {}
 
     # --------------------------- 工具方法 -------------------------------
 
@@ -100,10 +109,12 @@ class IndexBuildService:
     def _public_round(self, row: dict | None) -> dict | None:
         if row is None:
             return None
+        backend_start = row.get("backend_start")
         return {
             "round_id": row["round_id"],
             "status": row["status"],
             "backend_pid": row["backend_pid"],
+            "backend_start": backend_start.isoformat() if backend_start else None,
             "index_name": row["index_name"],
             "started_at": row["started_at"].isoformat(),
             "updated_at": row["updated_at"].isoformat(),
@@ -121,15 +132,20 @@ class IndexBuildService:
         try:
             if settings.lock_timeout_ms and settings.lock_timeout_ms > 0:
                 conn.execute(f"SET lock_timeout = '{int(settings.lock_timeout_ms)}ms'")
-            # 记录后端 PID，供取消与对账精确定位（不会误伤补录连接）。
-            pid = conn.execute("SELECT pg_backend_pid()").fetchone()[0]
-            # 双保险：无论轮次是否已被标记 cancel_requested 都登记 PID，
-            # 否则 watcher 可能因 backend_pid 为空而误判后端已停止。
+            # 记录后端 PID 与连接代际（backend_start），供取消与对账精确核对归属：
+            # PID 可能被后续连接复用，(pid, backend_start) 才唯一标识这一代构建连接。
+            pid, backend_start = conn.execute(
+                "SELECT pid, backend_start FROM pg_stat_activity "
+                "WHERE pid = pg_backend_pid()"
+            ).fetchone()
+            # 双保险：无论轮次是否已被标记 cancel_requested 都登记后端身份，
+            # 否则 watcher 可能因 backend_pid 为空而无法确认后端状态。
             with db.pool().connection() as meta_conn:
                 meta_conn.execute(
-                    "UPDATE index_build_rounds SET backend_pid = %s, updated_at = %s "
+                    "UPDATE index_build_rounds "
+                    "SET backend_pid = %s, backend_start = %s, updated_at = %s "
                     "WHERE round_id = %s",
-                    (pid, _now(), round_id),
+                    (pid, backend_start, _now(), round_id),
                 )
                 meta_conn.commit()
             log.info("round %s: CREATE UNIQUE INDEX CONCURRENTLY on backend pid=%s",
@@ -181,6 +197,60 @@ class IndexBuildService:
                 if self._thread is threading.current_thread():
                     self._thread = None
 
+    # --------------------------- 取消信号归属核对 ------------------------
+
+    def _confirmed_build_backend(self, conn, round_row: dict) -> dict | None:
+        """确认记录在案的后端“仍是本轮 CREATE 语句的执行者”，否则返回 None。
+
+        三重核对：PID 存在、连接代际（backend_start）一致、当前活跃执行本索引的
+        CREATE UNIQUE INDEX CONCURRENTLY。任一不符都说明该 PID 已不属于本轮构建
+        （旧连接断开、PID 被补录等新连接复用、语句不符），绝不可对其发取消信号。
+        """
+        pid = round_row["backend_pid"]
+        if not pid:
+            return None
+        st = db.get_backend_state(conn, pid)
+        if st is None:
+            return None  # 后端已退出
+        recorded_start = round_row.get("backend_start")
+        if recorded_start is not None and st["backend_start"] != recorded_start:
+            return None  # 连接已换代：该 PID 现在属于另一条连接
+        if st.get("state") != "active":
+            return None
+        if db.query_matches_create_index(st.get("query"), settings.index_name) is not True:
+            return None  # 语句不符（如补录 INSERT）或不可见：不确认
+        return st
+
+    def _signal_cancel_if_confirmed(self, round_row: dict) -> str:
+        """归属核对通过才向构建后端发取消信号。返回 sent/already_sent/pending_verification。
+
+        无法确认归属时不发任何信号：轮次保持 cancel_requested 待核实，
+        由 watcher 依据“原 SQL 是否确认停止”继续裁决，绝不误停补录连接。
+        说明：受限环境若禁止进程信号，pg_cancel_backend 会返回 false；此时可设置
+        BUILD_LOCK_TIMEOUT_MS，让被阻塞的构建在锁等待超时后自行中止，watcher 仍
+        依据“后端 SQL 是否真正停止”来裁决，不会误报取消。
+        """
+        rid = str(round_row["round_id"])
+        if not round_row["backend_pid"]:
+            log.info("round %s: 构建后端尚未登记，取消保持待核实", rid)
+            return "pending_verification"
+        with db.pool().connection() as conn:
+            st = self._confirmed_build_backend(conn, round_row)
+        if st is None:
+            log.warning(
+                "round %s: 记录的 backend_pid=%s 未通过归属核对（连接可能已断开/换代），"
+                "不发取消信号，保持待核实", rid, round_row["backend_pid"])
+            return "pending_verification"
+        identity = (st["pid"], str(st["backend_start"]))
+        with self._lock:
+            if self._signalled.get(rid) == identity:
+                return "already_sent"
+            self._signalled[rid] = identity
+        accepted = self._pg_cancel_backend(st["pid"])
+        log.info("round %s: 已向确认归属的构建后端发取消信号 pid=%s backend_start=%s accepted=%s",
+                 rid, st["pid"], st["backend_start"], accepted)
+        return "sent"
+
     # --------------------------- 取消轮询 -------------------------------
 
     def _watch_cancel(self, round_id: str, pid: int | None) -> None:
@@ -193,9 +263,11 @@ class IndexBuildService:
             with self._lock:
                 if self._watching_round_id == round_id:
                     self._watching_round_id = None
+                self._signalled.pop(round_id, None)
 
     def _watch_cancel_loop(self, round_id: str, pid: int | None) -> None:
         index_name = settings.index_name
+        no_identity_since: float | None = None  # 首次发现“从未登记过后端”的时刻
         while True:
             with db.pool().connection() as conn:
                 round_row = db.get_round_by_id(conn, round_id)
@@ -203,9 +275,12 @@ class IndexBuildService:
                     return
                 if round_row["status"] not in ("running", "cancel_requested"):
                     return  # 构建线程已自行终局（complete/failed）
-                # 每轮以数据库中的最新 PID 为准（取消可能早于 PID 首次登记）。
-                pid = round_row["backend_pid"] or pid
-                still_running = db.backend_running_create_index(conn, pid)
+                # 以“语句身份 + 连接代际”确认原 CREATE 语句是否仍在执行，
+                # 不凭进程号消失/变化下结论。
+                state = db.create_index_backend_state(
+                    conn, index_name,
+                    round_row["backend_pid"], round_row.get("backend_start"),
+                )
                 index_valid = db.index_is_valid_unique(conn, index_name)
             if index_valid:
                 # 取消未生效或生效前索引已建成：索引有效即报完成。
@@ -214,16 +289,45 @@ class IndexBuildService:
                 log.info("round %s: index valid before cancel took effect -> complete",
                          round_id)
                 return
-            if not still_running:
-                # 后端确实不再跑 CREATE INDEX，且索引无效：取消成立，清理残留。
-                self._safe_drop_invalid_index(index_name)
-                self._mark(round_id, status="cancelled",
-                           failure_type="cancelled",
-                           error="cancel confirmed: backend CREATE INDEX stopped; "
-                                 "invalid index cleaned up")
-                log.info("round %s cancelled and cleaned up", round_id)
+            if state == "running":
+                no_identity_since = None
+                # 已受理取消且确认归属后补发信号（覆盖“取消早于 PID 登记”等时序）；
+                # 同一代后端只发一次，换代后身份变化才允许再发。
+                if round_row["status"] == "cancel_requested":
+                    self._signal_cancel_if_confirmed(round_row)
+            elif state == "unknown":
+                # 无法确认（如系统视图权限受限）：保持待核实，绝不凭猜测裁决。
+                no_identity_since = None
+                log.info("round %s: 后端状态无法确认，保持 cancel_requested 待核实", round_id)
+            else:  # stopped：原 CREATE 语句确认已不在任何后端执行
+                if round_row["backend_pid"] is None:
+                    # 从未登记过后端：可能是取消早于构建线程登记。宽限期内保持
+                    # 待核实，避免凭“无进程号”误报取消。
+                    if no_identity_since is None:
+                        no_identity_since = time.monotonic()
+                    if time.monotonic() - no_identity_since < settings.cancel_verify_grace_s:
+                        threading.Event().wait(settings.reconcile_interval_s)
+                        continue
+                self._finalize_stopped_round(round_id, round_row["status"])
                 return
             threading.Event().wait(settings.reconcile_interval_s)
+
+    def _finalize_stopped_round(self, round_id: str, status: str) -> None:
+        """原 SQL 已确认停止且索引无效：按轮次状态裁决并安全清理残留索引。"""
+        self._safe_drop_invalid_index(settings.index_name)
+        if status == "cancel_requested":
+            self._mark(round_id, status="cancelled",
+                       failure_type="cancelled",
+                       error="cancel confirmed: backend CREATE INDEX stopped; "
+                             "invalid index cleaned up")
+            log.info("round %s cancelled and cleaned up", round_id)
+        else:
+            # 重启接续的 running 轮次：构建中断且未建成，如实报失败（去重后可重试）。
+            self._mark(round_id, status="failed",
+                       failure_type="other",
+                       error="backend CREATE INDEX stopped without a valid index; "
+                             "invalid index cleaned up")
+            log.info("round %s: backend stopped without valid index -> failed", round_id)
 
     # --------------------------- 重启对账 -------------------------------
 
@@ -260,14 +364,17 @@ class IndexBuildService:
             log.info("startup: round %s index is valid -> complete", round_id)
             return
 
-        # 索引尚无效：看后端是否还活着。
+        # 索引尚无效：按“语句身份 + 连接代际”确认构建 SQL 是否还在跑。
         with db.pool().connection() as conn:
-            alive = db.backend_running_create_index(conn, pid)
-        if alive:
-            # 上一进程的构建仍在 PG 内运行：只接续跟踪，绝不重跑。
+            state = db.create_index_backend_state(
+                conn, settings.index_name, pid, active.get("backend_start"))
+        if state in ("running", "unknown"):
+            # running：上一进程的构建仍在 PG 内运行，只接续跟踪，绝不重跑；
+            # unknown：无法确认（如视图权限受限），保持原状态待核实，同样只挂
+            # watcher 持续核对，不凭进程号变化误判终局。
             self._mark(round_id, restarted=True)
-            log.info("startup: round %s still running on pid=%s, attaching watcher",
-                     round_id, pid)
+            log.info("startup: round %s backend state=%s (pid=%s), attaching watcher",
+                     round_id, state, pid)
             self._start_watcher(round_id, pid)
         else:
             # 后端已不存在且索引无效：构建已中断。先立即落终局状态（不被长事务阻塞），
@@ -362,7 +469,12 @@ class IndexBuildService:
         return self._public_round(row), 202
 
     def request_cancel(self, round_id: str | None = None) -> tuple[dict, int]:
-        """受理取消：先落 cancel_requested 并返回 202，终局由 watcher 裁决。"""
+        """受理取消：先落 cancel_requested 并返回 202，终局由 watcher 裁决。
+
+        取消信号只发给“确认仍在执行本轮 CREATE UNIQUE INDEX CONCURRENTLY”的连接；
+        无法确认（后端未登记、已断开、PID 被补录等连接复用、语句不符）时，
+        仅保持 cancel_requested 待核实，不向任何连接发信号。
+        """
         with db.pool().connection() as conn:
             if db.index_is_valid_unique(conn, settings.index_name):
                 row = db.latest_round(conn)
@@ -381,7 +493,6 @@ class IndexBuildService:
             if row["status"] in ("complete", "failed", "cancelled"):
                 return self._public_round(row), 200
 
-            pid = row["backend_pid"]
             if row["status"] == "running":
                 conn.execute(
                     "UPDATE index_build_rounds SET status = 'cancel_requested', "
@@ -391,16 +502,13 @@ class IndexBuildService:
                 conn.commit()
                 row = db.get_round_by_id(conn, row["round_id"])
 
-        # 只对记录在案的构建后端发取消信号；补录连接与后续轮次的 PID 不可能等于它。
-        if pid:
-            cancelled = self._pg_cancel_backend(pid)
-            log.info("cancel signal sent to pid=%s, accepted=%s", pid, cancelled)
-        # 说明：受限环境若禁止进程信号，pg_cancel_backend 会返回 false。
-        # 此时可设置 BUILD_LOCK_TIMEOUT_MS，让被阻塞的构建在锁等待超时后自行中止，
-        # watcher 仍依据“后端 SQL 是否真正停止”来裁决，不会误报取消。
-        self._start_watcher(str(row["round_id"]), pid)
+        # 归属核对：仅确认连接仍执行本轮 CREATE 语句时才发取消信号；
+        # 否则保持待核实，由 watcher 继续确认，绝不误停补录等无关连接。
+        signal = self._signal_cancel_if_confirmed(row)
+        self._start_watcher(str(row["round_id"]), row["backend_pid"])
         view = self._public_round(row)
         view["cancel_accepted"] = True
+        view["cancel_signal"] = signal
         return view, 202
 
     def _pg_cancel_backend(self, pid: int) -> bool:
@@ -430,6 +538,7 @@ class IndexBuildService:
         if backend:
             view["backend"] = {
                 "pid": backend["pid"],
+                "backend_start": backend.get("backend_start"),
                 "state": backend["state"],
                 "wait_event_type": backend["wait_event_type"],
                 "wait_event": backend["wait_event"],

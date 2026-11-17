@@ -15,6 +15,9 @@ class Settings:
     lock_timeout_ms: int = int(os.getenv("BUILD_LOCK_TIMEOUT_MS", "0"))
     # 后台对账轮询间隔（秒）：确认取消、重启接续。
     reconcile_interval_s: float = float(os.getenv("RECONCILE_INTERVAL_S", "1.5"))
+    # 取消核实宽限（秒）：轮次从未登记过后端时，watcher 判定“SQL 已停止”前的等待
+    # 窗口，避免取消早于构建线程登记 backend_pid 时凭“无进程号”误报取消。
+    cancel_verify_grace_s: float = float(os.getenv("CANCEL_VERIFY_GRACE_S", "10"))
     index_name: str = os.getenv("UNIQUE_INDEX_NAME", "uq_reports_lab_no_report_no")
     table_name: str = "reports"
 

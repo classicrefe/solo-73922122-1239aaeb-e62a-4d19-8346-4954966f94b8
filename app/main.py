@@ -34,9 +34,10 @@ app = FastAPI(
     description=(
         "对持续补录的 reports 表在线构建 (lab_no, report_no) 唯一索引；"
         "支持发起、查询、取消 CREATE UNIQUE INDEX CONCURRENTLY，"
+        "取消信号经后端归属核对（防 PID 复用误停补录），"
         "构建期间补录不阻塞，API 重启后接续跟踪。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     default_response_class=AppJSONResponse,
     lifespan=lifespan,
 )
@@ -134,10 +135,11 @@ def index_status(round_id: str | None = None):
 
 @app.post("/index/cancel", status_code=202)
 def cancel_build(round_id: str | None = None):
-    """取消构建：先受理（cancel_requested），后端 SQL 确认停止后才转 cancelled。
+    """取消构建：先受理（cancel_requested），原 SQL 确认停止且索引无效后才转 cancelled。
 
-    只向记录在案的构建后端 PID 发 pg_cancel_backend，不影响补录连接；
-    若索引已有效则报 complete。
+    取消信号仅发给“确认仍在执行本轮 CREATE UNIQUE INDEX CONCURRENTLY”的连接
+    （backend_pid + 连接代际 backend_start + 语句文本三重核对）；无法确认时
+    保持待核实，绝不误停补录连接；索引已有效则报 complete。
     """
     view, code = service.request_cancel(round_id)
     return AppJSONResponse(view, status_code=code)

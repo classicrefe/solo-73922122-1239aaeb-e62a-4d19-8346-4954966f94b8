@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS index_build_rounds (
                     'cancelled'       -- 后端 SQL 已确认停止且索引无效
                 )),
     backend_pid INTEGER,                       -- 执行 CREATE INDEX 的 PostgreSQL 后端 PID
+    backend_start TIMESTAMPTZ,                 -- 构建后端的连接建立时间（连接代际标识，防 PID 复用误判）
     index_name  TEXT NOT NULL,
     started_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -44,6 +45,11 @@ CREATE TABLE IF NOT EXISTS index_build_rounds (
 );
 
 COMMENT ON TABLE index_build_rounds IS 'CREATE UNIQUE INDEX CONCURRENTLY 构建轮次';
+COMMENT ON COLUMN index_build_rounds.backend_pid IS '执行 CREATE INDEX 的后端 PID（需配合 backend_start 核对连接代际）';
+COMMENT ON COLUMN index_build_rounds.backend_start IS '构建后端连接建立时间：PID 可能被复用，(pid, backend_start) 才唯一标识一代连接';
+
+-- 老库升级：补登连接代际列（幂等；新库上面已含该列，此句为空操作）。
+ALTER TABLE index_build_rounds ADD COLUMN IF NOT EXISTS backend_start TIMESTAMPTZ;
 
 -- 同一时刻只允许一轮活跃构建（running 或 cancel_requested 各最多一条）。
 -- 该约束在数据库层面兜底，即使多个 API 实例并发发起也不会出现两轮并发构建。

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 import pytest
@@ -296,3 +297,203 @@ def test_start_build_when_index_already_valid_reports_complete(client):
     assert resp.status_code == 200
     assert resp.json()["status"] == "complete"
     assert resp.json()["index_valid"] is True
+
+
+# --------------------- 取消的后端归属核对（连接换代交错） ---------------------
+
+def test_query_matches_create_index():
+    """语句身份识别：只有本索引的 CREATE UNIQUE INDEX CONCURRENTLY 才算匹配。"""
+    idx = settings.index_name
+    f = dbmod.query_matches_create_index
+    assert f(f'CREATE UNIQUE INDEX CONCURRENTLY "{idx}" '
+             "ON reports (lab_no, report_no)", idx) is True
+    assert f(f"create  unique  index concurrently {idx} on reports(lab_no)", idx) is True
+    assert f("INSERT INTO reports(lab_no,report_no,measured) VALUES ($1,$2,$3)", idx) is False
+    assert f("CREATE INDEX CONCURRENTLY idx_other ON reports(lab_no)", idx) is False
+    assert f("CREATE UNIQUE INDEX CONCURRENTLY other_name ON reports(lab_no)", idx) is False
+    assert f("<insufficient privilege>", idx) is None
+    assert f(None, idx) is False
+    assert f("", idx) is False
+
+
+def _make_invalid_index_leftover():
+    """重复键导致 CIC 失败，留下无效索引（执行后端随即结束）。"""
+    with dbmod.pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO reports(lab_no,report_no,measured) VALUES "
+            "('DUP','K',1),('DUP','K',2)"
+        )
+        conn.commit()
+    cic = psycopg.connect(settings.database_url, autocommit=True)
+    try:
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            cic.execute(
+                f'CREATE UNIQUE INDEX CONCURRENTLY "{settings.index_name}" '
+                "ON reports (lab_no, report_no)"
+            )
+    finally:
+        cic.close()
+    with dbmod.pool().connection() as conn:
+        meta = dbmod.get_index_status(conn, settings.index_name)
+        assert meta and meta["is_valid"] is False
+
+
+def _register_round_with_backend(status: str, pid: int, backend_start) -> str:
+    """手工登记一轮活跃构建，其 backend_pid/backend_start 指向给定连接身份。"""
+    with dbmod.pool().connection() as conn:
+        rid = conn.execute(
+            "INSERT INTO index_build_rounds(round_id,status,index_name,"
+            "backend_pid,backend_start) "
+            "VALUES (gen_random_uuid(),%s,%s,%s,%s) RETURNING round_id",
+            (status, settings.index_name, pid, backend_start),
+        ).fetchone()["round_id"]
+        conn.commit()
+    return str(rid)
+
+
+def _spy_cancel_signal(monkeypatch) -> list[int]:
+    """记录 service 实际发出 pg_cancel_backend 的 PID 列表。"""
+    sent: list[int] = []
+    orig = service._pg_cancel_backend
+    monkeypatch.setattr(service, "_pg_cancel_backend",
+                        lambda p: (sent.append(p), orig(p))[1])
+    return sent
+
+
+def test_cancel_does_not_signal_reused_backfill_pid(client, monkeypatch):
+    """连接换代交错（同 PID 复用）：旧构建连接已断开，记录的 backend_pid 连同
+    backend_start 当前属于一条补录连接。取消不得向该连接发信号、不得误停补录；
+    原 SQL 确认停止且索引无效后才裁决 cancelled 并清理。"""
+    _make_invalid_index_leftover()
+    backfill = psycopg.connect(settings.database_url, autocommit=True)
+    try:
+        pid, bstart = backfill.execute(
+            "SELECT pid, backend_start FROM pg_stat_activity "
+            "WHERE pid = pg_backend_pid()"
+        ).fetchone()
+        rid = _register_round_with_backend("running", pid, bstart)
+
+        sent = _spy_cancel_signal(monkeypatch)
+        ack = client.post("/index/cancel", params={"round_id": rid})
+        assert ack.status_code == 202
+        assert ack.json()["status"] == "cancel_requested"
+        # 归属核对失败（该连接在跑补录而非本轮 CREATE）：只受理，不发信号
+        assert ack.json()["cancel_signal"] == "pending_verification"
+
+        # 补录连接未被误停：取消受理后立即可写
+        backfill.execute(
+            "INSERT INTO reports(lab_no,report_no,measured) VALUES ('BF','ALIVE',1)")
+
+        # 原 SQL 确认停止（无任何后端执行本索引 CREATE）且索引无效 -> cancelled + 清理
+        st = poll_status(client, "cancelled", timeout_s=30)
+        assert st["round_id"] == rid
+        assert st["failure_type"] == "cancelled"
+        with dbmod.pool().connection() as conn:
+            assert dbmod.get_index_status(conn, settings.index_name) is None
+
+        # 全过程未向被复用的 PID 发过任何取消信号；补录连接仍然可用
+        assert sent == []
+        assert backfill.execute("SELECT 1").fetchone()[0] == 1
+    finally:
+        backfill.close()
+
+
+def test_cancel_does_not_signal_when_generation_mismatch(client, monkeypatch):
+    """连接换代交错（代际不符）：记录的 backend_start 属于上一代连接，
+    该 PID 现已被新连接复用。归属核对失败 -> 不发信号，保持待核实直至确认停止。"""
+    _make_invalid_index_leftover()
+    backfill = psycopg.connect(settings.database_url, autocommit=True)
+    try:
+        pid = backfill.execute("SELECT pg_backend_pid()").fetchone()[0]
+        stale_start = datetime.now(timezone.utc) - timedelta(hours=1)
+        rid = _register_round_with_backend("running", pid, stale_start)
+
+        sent = _spy_cancel_signal(monkeypatch)
+        ack = client.post("/index/cancel", params={"round_id": rid})
+        assert ack.status_code == 202
+        assert ack.json()["cancel_signal"] == "pending_verification"
+        backfill.execute(
+            "INSERT INTO reports(lab_no,report_no,measured) VALUES ('BF','ALIVE2',1)")
+        st = poll_status(client, "cancelled", timeout_s=30)
+        assert st["round_id"] == rid
+        assert sent == []
+        assert backfill.execute("SELECT 1").fetchone()[0] == 1
+    finally:
+        backfill.close()
+
+
+def test_cancel_waits_grace_when_backend_never_registered(client):
+    """取消早于后端登记：宽限期内保持待核实，不凭“无进程号”立即报取消；
+    宽限过后确认无任何后端执行本语句，才裁决 cancelled。"""
+    _make_invalid_index_leftover()
+    rid = _register_round_with_backend("running", None, None)
+    old_grace = settings.cancel_verify_grace_s
+    object.__setattr__(settings, "cancel_verify_grace_s", 2.0)
+    try:
+        t0 = time.monotonic()
+        ack = client.post("/index/cancel", params={"round_id": rid})
+        assert ack.status_code == 202
+        assert ack.json()["cancel_signal"] == "pending_verification"
+        # 宽限期内：仍为 cancel_requested，未误报取消
+        time.sleep(0.8)
+        st = client.get("/index/status", params={"round_id": rid}).json()
+        assert st["status"] == "cancel_requested"
+        # 宽限过后：确认无后端执行本语句且索引无效 -> cancelled 并清理
+        st = poll_status(client, "cancelled", timeout_s=30)
+        assert st["round_id"] == rid
+        assert time.monotonic() - t0 >= 1.5
+        with dbmod.pool().connection() as conn:
+            assert dbmod.get_index_status(conn, settings.index_name) is None
+    finally:
+        object.__setattr__(settings, "cancel_verify_grace_s", old_grace)
+
+
+def test_cancel_signals_only_confirmed_build_backend(client, monkeypatch):
+    """归属核对通过才发信号：存活构建被取消时，信号恰好发给确认的构建后端一次；
+    待核实期间重复构建复用同一轮、补录与状态查询照常；重复取消不重复发信号。"""
+    for i in range(5):
+        client.post("/reports", json={"lab_no": "L", "report_no": f"R{i}", "measured": i})
+    blocker = _open_tx_conn()
+    sent = _spy_cancel_signal(monkeypatch)
+    try:
+        build = client.post("/index/build").json()
+        round_id = build["round_id"]
+        # 等待构建线程登记后端身份（pid + 连接代际 backend_start）
+        deadline = time.time() + 10
+        pid = None
+        while time.time() < deadline:
+            st = client.get("/index/status").json()
+            pid = st.get("backend_pid")
+            if pid and st.get("backend_start"):
+                break
+            time.sleep(0.2)
+        assert pid
+
+        ack = client.post("/index/cancel")
+        assert ack.status_code == 202
+        assert ack.json()["status"] == "cancel_requested"
+        assert ack.json()["cancel_signal"] == "sent"
+        assert sent == [pid]  # 恰好一次、只发给确认归属的构建后端
+
+        # 重复取消：同一代后端不重复发信号
+        ack2 = client.post("/index/cancel")
+        assert ack2.status_code == 202
+        assert ack2.json()["cancel_signal"] == "already_sent"
+        assert sent == [pid]
+
+        # 待核实期间：重复构建复用同一轮，补录照常提交
+        again = client.post("/index/build")
+        assert again.status_code == 200
+        assert again.json()["reused"] is True
+        assert again.json()["round_id"] == round_id
+        r = client.post("/reports", json={"lab_no": "L9", "report_no": "BX", "measured": 1})
+        assert r.status_code == 201
+    finally:
+        blocker.rollback()
+        blocker.close()
+    # 沙箱禁止信号 -> 构建跑完、索引有效 -> complete（有效索引保留）
+    final = poll_status(client, "complete", timeout_s=30)
+    assert final["index"]["is_valid"] is True
+    with dbmod.pool().connection() as conn:
+        assert dbmod.index_is_valid_unique(conn, settings.index_name)
+    assert sent == [pid]

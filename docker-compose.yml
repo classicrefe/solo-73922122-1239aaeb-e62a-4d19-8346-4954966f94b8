@@ -26,6 +26,7 @@ services:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/report_warehouse
       BUILD_LOCK_TIMEOUT_MS: "0"
       RECONCILE_INTERVAL_S: "1.5"
+      CANCEL_VERIFY_GRACE_S: "10"
     ports:
       - "8000:8000"
 
